@@ -709,7 +709,7 @@ ax.text(0.05, 0.08,
         bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7))
 
 plt.tight_layout()
-plt.savefig("/mnt/user-data/outputs/lh_kinetics_v4_fit.png", dpi=150, bbox_inches='tight')
+plt.savefig("lh_kinetics_v4_fit.png", dpi=150, bbox_inches='tight')
 plt.show()
 print("\nFigure saved to lh_kinetics_v4_fit.png")
 
