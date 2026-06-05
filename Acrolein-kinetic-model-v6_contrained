@@ -1,0 +1,116 @@
+import numpy as np
+from scipy.optimize import least_squares
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# --- Physical Constants ---
+F = 96485.332
+R = 8.3144626
+T = 298.15
+eV_to_J = 96485.332
+n_e = 2
+
+def load_experimental_data():
+    E_exp = np.linspace(0.65, 1.15, 50)
+    theta_poison = np.linspace(0.8, 0.8, 50)
+    j_exp = 2.5 * np.exp(-((E_exp - 0.90)**2)/0.015)
+    j_exp[E_exp < 0.68] = 0.0
+    gamma_sites = 1.3e-9
+    TOF_exp = j_exp * 1e-3 / (n_e * F * gamma_sites)
+    return pd.DataFrame({
+        'E_RHE': E_exp,
+        'j_ac_mA': j_exp,
+        'TOF_s1': TOF_exp,
+        'theta_poison': theta_poison
+    })
+
+def lh_kinetic_model(params, E, C_prop, theta_poison):
+    E0_OH, K_P, k0, Ea_eV = params
+    K_OH = np.exp((F * (E - E0_OH)) / (R * T))
+    denominator = 1.0 + K_OH + (K_P * C_prop)
+    theta_star = (1.0 - theta_poison) / denominator
+    theta_OH = K_OH * theta_star
+    theta_P = (K_P * C_prop) * theta_star
+    Ea_J = Ea_eV * eV_to_J
+    k_cpl = k0 * np.exp(-Ea_J / (R * T))
+    r_ac = k_cpl * theta_P * theta_OH
+    j_ac = n_e * F * r_ac * 1000
+    return j_ac, theta_OH, theta_P, theta_star, r_ac
+
+def residuals(params, E, C_prop, theta_poison, j_exp):
+    j_model, _, _, _, _ = lh_kinetic_model(params, E, C_prop, theta_poison)
+    return j_model - j_exp
+
+def main():
+    df = load_experimental_data()
+    C_prop = 1.0
+    initial_guess = [0.72, 2.0, 1e5, 0.65]
+    bounds = (
+        [0.65, 0.1, 1e0,  0.4],
+        [0.85, 100, 1e12, 1.0]
+    )
+    res = least_squares(
+        residuals,
+        x0=initial_guess,
+        args=(df['E_RHE'], C_prop, df['theta_poison'], df['j_ac_mA']),
+        bounds=bounds,
+        loss='soft_l1'
+    )
+    fitted_params = res.x
+
+    j_model, theta_OH, theta_P, theta_star, r_ac = lh_kinetic_model(
+        fitted_params, df['E_RHE'], C_prop, df['theta_poison']
+    )
+    df['j_model']    = j_model
+    df['theta_OH']   = theta_OH
+    df['theta_P']    = theta_P
+    df['theta_star'] = theta_star
+    df['r_ac']       = r_ac   # mol/cm²/s
+
+    print("--- Fitted Parameters ---")
+    print(f"E0_OH = {fitted_params[0]:.3f} V vs RHE")
+    print(f"K_P   = {fitted_params[1]:.2f}")
+    print(f"k0    = {fitted_params[2]:.2e} mol/cm2 s")
+    print(f"Ea    = {fitted_params[3]:.2f} eV")
+
+    # ── 3-panel figure ──────────────────────────────────────────────────────
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
+
+    # Panel 1: Current Density Fit
+    ax1.plot(df['E_RHE'], df['j_ac_mA'], 'ko', ms=4, label='Exp (dummy data)')
+    ax1.plot(df['E_RHE'], df['j_model'], 'b-', linewidth=2, label='LH Model')
+    ax1.set_xlabel('Potential (V vs RHE)')
+    ax1.set_ylabel(r'$j_{acrolein}$ (mA cm$^{-2}$)')
+    ax1.set_title('Acrolein Partial Current Density')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Surface Coverages
+    ax2.plot(df['E_RHE'], df['theta_OH'],     'r-',          lw=2,   label=r'$\theta_{OH}$')
+    ax2.plot(df['E_RHE'], df['theta_P'],      'g-',          lw=2,   label=r'$\theta_{propene}$')
+    ax2.plot(df['E_RHE'], df['theta_star'],   'k--',         lw=1.5, label=r'$\theta^{*}$ (free)')
+    ax2.plot(df['E_RHE'], df['theta_poison'], color='gray',
+             alpha=0.6, lw=1.5, label=r'$\theta_{poison}$')
+    ax2.set_xlabel('Potential (V vs RHE)')
+    ax2.set_ylabel('Fractional Coverage')
+    ax2.set_title('Potential-Dependent Site Occupancy')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Acrolein Formation Rate vs Potential
+    ax3.plot(df['E_RHE'], df['r_ac'] * 1e9, color='darkorange', lw=2.5)
+    ax3.axvline(0.70, color='gray',       ls='--', lw=0.9, label='OH onset (0.70 V)')
+    ax3.axvline(df['E_RHE'][df['r_ac'].argmax()], color='red',
+                ls=':', lw=1.2,
+                label=f"Peak: {df['E_RHE'][df['r_ac'].argmax()]:.2f} V")
+    ax3.set_xlabel('Potential (V vs RHE)')
+    ax3.set_ylabel(r'$r_{acrolein}$ (nmol cm$^{-2}$ s$^{-1}$)')
+    ax3.set_title('Acrolein Formation Rate')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
