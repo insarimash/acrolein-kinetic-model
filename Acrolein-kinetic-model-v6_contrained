@@ -1,116 +1,183 @@
+import os
 import numpy as np
-from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
 import pandas as pd
 
-# --- Physical Constants ---
-F = 96485.332
-R = 8.3144626
-T = 298.15
-eV_to_J = 96485.332
-n_e = 2
+# =========================================================================
+# 1. DEFINE THE MACRO-KINETIC MODEL FUNCTION FOR FITTING
+# =========================================================================
+def propylene_oxidation_rate(E, log_k0, alpha, dG_OH_eff):
+    """
+    Calculates acrolein formation rate based on the strict 4-species site balance:
+    theta_free + theta_propene + theta_OH + theta_poison = 1
+    """
+    # Fixed Physical Constants
+    T = 298.15
+    k_B = 8.617e-5
+    F = 96485.33
+    R = 8.314
+    f = F / (R * T)
+    
+    # Fixed constraints from description
+    theta_poison = 0.85          # Constant spectator layer (>80%)
+    theta_available = 1.0 - theta_poison
+    Ea_coupling_eff = 0.55       # Attenuated activation energy (eV)
+    
+    # Propene adsorption constant
+    K_propene = np.exp(0.2 / (k_B * T))
+    
+    # Potential-dependent OH adsorption equilibrium 
+    K_OH = np.exp(-dG_OH_eff / (k_B * T)) * np.exp(f * (E - 0.7))
+    
+    # Competitive Langmuir-Hinshelwood Isotherms
+    denominator = 1 + K_propene + K_OH
+    theta_propene = theta_available * (K_propene / denominator)
+    theta_OH = theta_available * (K_OH / denominator)
+    
+    # Rate Limiting Step (RLS) C-O Coupling kinetics
+    k0 = 10**log_k0
+    thermal_term = np.exp(-Ea_coupling_eff / (k_B * T))
+    electrochemical_term = np.exp(alpha * f * (E - 0.7))
+    k_coupling = k0 * thermal_term * electrochemical_term
+    
+    # Overall Macroscopic Rate
+    r_acrolein = k_coupling * theta_propene * theta_OH
+    return r_acrolein
 
-def load_experimental_data():
-    E_exp = np.linspace(0.65, 1.15, 50)
-    theta_poison = np.linspace(0.8, 0.8, 50)
-    j_exp = 2.5 * np.exp(-((E_exp - 0.90)**2)/0.015)
-    j_exp[E_exp < 0.68] = 0.0
-    gamma_sites = 1.3e-9
-    TOF_exp = j_exp * 1e-3 / (n_e * F * gamma_sites)
-    return pd.DataFrame({
-        'E_RHE': E_exp,
-        'j_ac_mA': j_exp,
-        'TOF_s1': TOF_exp,
-        'theta_poison': theta_poison
-    })
+# =========================================================================
+# 2. LOAD OR GENERATE EXPERIMENTAL DATA (0.2 V to 0.9 V)
+# =========================================================================
+if os.path.exists('Data.xlsx'):
+    print("Loading experimental data from 'Data.xlsx'...")
+    df = pd.read_excel('Data.xlsx', sheet_name='Sheet1')
+    
+    # Filter data to strict 0.2 to 0.9 boundaries
+    df_filtered = df[(df['Potential'] >= 0.7) & (df['Potential'] <= 1.1)]
+    E_experimental = df_filtered['Potential'].to_numpy()
+    j_experimental = df_filtered['Current_ac'].to_numpy()
+else:
+    print("Warning: 'Data.xlsx' not found. Generating synthetic dummy data...")
+    np.random.seed(42) # For reproducible dummy data
+    
+    # Adjusted potential range: 0.2 V to 0.9 V
+    E_experimental = np.linspace(0.2, 0.9, 35)
+    
+    # Create realistic underlying data using reasonable true parameters
+    j_true = propylene_oxidation_rate(E_experimental, log_k0=7.5, alpha=0.45, dG_OH_eff=-0.12)
+    
+    # Add 5% Gaussian noise to simulate real experimental conditions
+    noise = np.random.normal(0, np.max(j_true) * 0.05, len(E_experimental))
+    j_experimental = j_true + noise
+    j_experimental = np.clip(j_experimental, 0, None) # Current shouldn't be negative here
 
-def lh_kinetic_model(params, E, C_prop, theta_poison):
-    E0_OH, K_P, k0, Ea_eV = params
-    K_OH = np.exp((F * (E - E0_OH)) / (R * T))
-    denominator = 1.0 + K_OH + (K_P * C_prop)
-    theta_star = (1.0 - theta_poison) / denominator
-    theta_OH = K_OH * theta_star
-    theta_P = (K_P * C_prop) * theta_star
-    Ea_J = Ea_eV * eV_to_J
-    k_cpl = k0 * np.exp(-Ea_J / (R * T))
-    r_ac = k_cpl * theta_P * theta_OH
-    j_ac = n_e * F * r_ac * 1000
-    return j_ac, theta_OH, theta_P, theta_star, r_ac
+# =========================================================================
+# 3. RUN THE NON-LINEAR REGRESSION (FIT PARAMETERS)
+# =========================================================================
+print("\nStarting macro-kinetic parameter optimization...")
 
-def residuals(params, E, C_prop, theta_poison, j_exp):
-    j_model, _, _, _, _ = lh_kinetic_model(params, E, C_prop, theta_poison)
-    return j_model - j_exp
+# Massively broadened bounds to accommodate different data scales
+# log_k0: [-5 to 20], alpha: [0.0 to 2.0], dG_OH_eff: [-1.5 to 1.5]
+initial_guesses = [5.0, 0.5, -0.15]
+bounds = ([-5.0, 0.0, -1.5], [20.0, 2.0, 1.5]) 
 
-def main():
-    df = load_experimental_data()
-    C_prop = 1.0
-    initial_guess = [0.72, 2.0, 1e5, 0.65]
-    bounds = (
-        [0.65, 0.1, 1e0,  0.4],
-        [0.85, 100, 1e12, 1.0]
-    )
-    res = least_squares(
-        residuals,
-        x0=initial_guess,
-        args=(df['E_RHE'], C_prop, df['theta_poison'], df['j_ac_mA']),
+try:
+    popt, pcov = curve_fit(
+        propylene_oxidation_rate, 
+        E_experimental, 
+        j_experimental, 
+        p0=initial_guesses, 
         bounds=bounds,
-        loss='soft_l1'
+        maxfev=15000  # High limit for complex exponential functions
     )
-    fitted_params = res.x
 
-    j_model, theta_OH, theta_P, theta_star, r_ac = lh_kinetic_model(
-        fitted_params, df['E_RHE'], C_prop, df['theta_poison']
-    )
-    df['j_model']    = j_model
-    df['theta_OH']   = theta_OH
-    df['theta_P']    = theta_P
-    df['theta_star'] = theta_star
-    df['r_ac']       = r_ac   # mol/cm²/s
+    fitted_log_k0, fitted_alpha, fitted_dG_OH = popt
+    print("\n--- Fitting Complete ---")
+    print(f"Optimized Pre-exponential Factor (k0): {10**fitted_log_k0:.2e}")
+    print(f"Optimized Transfer Coefficient (alpha): {fitted_alpha:.3f}")
+    print(f"Optimized Effective OH Adsorption Energy (dG_OH): {fitted_dG_OH:.3f} eV\n")
+    
+except Exception as e:
+    print(f"\nOptimization failed: {e}")
+    print("Check your experimental data for extreme outliers or flatlines.")
+    exit()
 
-    print("--- Fitted Parameters ---")
-    print(f"E0_OH = {fitted_params[0]:.3f} V vs RHE")
-    print(f"K_P   = {fitted_params[1]:.2f}")
-    print(f"k0    = {fitted_params[2]:.2e} mol/cm2 s")
-    print(f"Ea    = {fitted_params[3]:.2f} eV")
+# =========================================================================
+# 3.5 CALCULATE GOODNESS-OF-FIT METRICS (R^2 and RMSE)
+# =========================================================================
+# First, calculate what the model PREDICTS at your exact experimental potentials
+j_predicted = propylene_oxidation_rate(E_experimental, *popt)
 
-    # ── 3-panel figure ──────────────────────────────────────────────────────
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
+# Calculate Residual Sum of Squares (SS_res)
+ss_res = np.sum((j_experimental - j_predicted)**2)
 
-    # Panel 1: Current Density Fit
-    ax1.plot(df['E_RHE'], df['j_ac_mA'], 'ko', ms=4, label='Exp (dummy data)')
-    ax1.plot(df['E_RHE'], df['j_model'], 'b-', linewidth=2, label='LH Model')
-    ax1.set_xlabel('Potential (V vs RHE)')
-    ax1.set_ylabel(r'$j_{acrolein}$ (mA cm$^{-2}$)')
-    ax1.set_title('Acrolein Partial Current Density')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+# Calculate Total Sum of Squares (SS_tot)
+ss_tot = np.sum((j_experimental - np.mean(j_experimental))**2)
 
-    # Panel 2: Surface Coverages
-    ax2.plot(df['E_RHE'], df['theta_OH'],     'r-',          lw=2,   label=r'$\theta_{OH}$')
-    ax2.plot(df['E_RHE'], df['theta_P'],      'g-',          lw=2,   label=r'$\theta_{propene}$')
-    ax2.plot(df['E_RHE'], df['theta_star'],   'k--',         lw=1.5, label=r'$\theta^{*}$ (free)')
-    ax2.plot(df['E_RHE'], df['theta_poison'], color='gray',
-             alpha=0.6, lw=1.5, label=r'$\theta_{poison}$')
-    ax2.set_xlabel('Potential (V vs RHE)')
-    ax2.set_ylabel('Fractional Coverage')
-    ax2.set_title('Potential-Dependent Site Occupancy')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+# Calculate R-squared
+r_squared = 1 - (ss_res / ss_tot)
 
-    # Panel 3: Acrolein Formation Rate vs Potential
-    ax3.plot(df['E_RHE'], df['r_ac'] * 1e9, color='darkorange', lw=2.5)
-    ax3.axvline(0.70, color='gray',       ls='--', lw=0.9, label='OH onset (0.70 V)')
-    ax3.axvline(df['E_RHE'][df['r_ac'].argmax()], color='red',
-                ls=':', lw=1.2,
-                label=f"Peak: {df['E_RHE'][df['r_ac'].argmax()]:.2f} V")
-    ax3.set_xlabel('Potential (V vs RHE)')
-    ax3.set_ylabel(r'$r_{acrolein}$ (nmol cm$^{-2}$ s$^{-1}$)')
-    ax3.set_title('Acrolein Formation Rate')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
+# Calculate Root Mean Square Error (RMSE)
+rmse = np.sqrt(ss_res / len(j_experimental))
 
-    plt.tight_layout()
-    plt.show()
+print("--- Model Performance Metrics ---")
+print(f"R-squared (R2): {r_squared:.4f}")
+print(f"RMSE:           {rmse:.3f} (same units as your y-axis)")
+print("---------------------------------\n")
 
-if __name__ == "__main__":
-    main()
+# =========================================================================
+# 4. GENERATE PLOTS USING THE FITTED MODEL
+# =========================================================================
+# High-resolution array strictly matching the new 0.7 to 1.1 range
+E_fine = np.linspace(0.7, 1.1, 200)
+j_fitted = propylene_oxidation_rate(E_fine, *popt)
+
+# Helper loop to extract coverages using the newly optimized parameters
+T, k_B, F, R = 298.15, 8.617e-5, 96485.33, 8.314
+f = F / (R * T)
+K_propene = np.exp(0.2 / (k_B * T))
+
+theta_propene_list = []
+theta_OH_list = []
+theta_free_list = []
+theta_poison_list = []
+
+for E in E_fine:
+    K_OH = np.exp(-fitted_dG_OH / (k_B * T)) * np.exp(f * (E - 0.7))
+    denom = 1 + K_propene + K_OH
+    
+    theta_propene_list.append(0.15 * (K_propene / denom))
+    theta_OH_list.append(0.15 * (K_OH / denom))
+    theta_free_list.append(0.15 * (1.0 / denom))
+    theta_poison_list.append(0.85)
+
+# --- Plot 1: Current of Formation of Acrolein vs. Potential ---
+plt.figure(figsize=(8, 5))
+plt.scatter(E_experimental, j_experimental, color='black', alpha=0.7, label='Experimental Data')
+plt.plot(E_fine, j_fitted, color='blue', linewidth=2.5, label='Fitted Macro-Kinetic Model')
+plt.axvline(x=0.7, color='gray', linestyle='--', alpha=0.6, label='OH Onset (0.7 V)')
+plt.xlabel('Potential (V vs. RHE)')
+plt.ylabel('Current Density ($\mu$A/cm$^2_{ECSA}$)')
+plt.title('Current of Formation of Acrolein vs. Potential')
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig('rate_vs_potential.png', dpi=300)
+plt.show() 
+
+# --- Plot 2: Coverage of All Species vs. Potential ---
+plt.figure(figsize=(8, 5))
+plt.plot(E_fine, theta_poison_list, label=r'$\theta_{poison}$ (Spectator Layer)', color='black', linestyle='--', linewidth=2)
+plt.plot(E_fine, theta_propene_list, label=r'$\theta_{propene}$ (Allylic Adsorbate)', color='green', linewidth=2)
+plt.plot(E_fine, theta_OH_list, label=r'$\theta_{OH}$ (Water Activation)', color='orange', linewidth=2)
+plt.plot(E_fine, theta_free_list, label=r'$\theta_{free}$ (Empty Metallic Sites)', color='blue', linewidth=2)
+plt.xlabel('Potential (V vs. RHE)')
+plt.ylabel('Fractional Surface Coverage ($\theta$)')
+plt.title('Surface Coverage of Adsorbed Species vs. Potential (Fitted)')
+plt.grid(True, alpha=0.3)
+plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+plt.tight_layout()
+plt.savefig('coverage_vs_potential.png', dpi=300)
+plt.show() 
+
+print("Plots successfully rendered and saved ('rate_vs_potential.png' and 'coverage_vs_potential.png').")
